@@ -59,6 +59,49 @@ function createInitialProperties(): Record<number, PropertyState> {
   return properties;
 }
 
+
+function countOwnedRailroads(game: GameState, playerId: string): number {
+  return BOARD_TILES.filter(t => t.type === 'railroad' && game.properties[t.id]?.ownerId === playerId).length;
+}
+
+function countOwnedUtilities(game: GameState, playerId: string): number {
+  return BOARD_TILES.filter(t => t.type === 'utility' && game.properties[t.id]?.ownerId === playerId).length;
+}
+
+function calculateRent(game: GameState, tile: typeof BOARD_TILES[number], prop: PropertyState, dice: [number, number]): number {
+  if (prop.isMortgaged || !prop.ownerId) return 0;
+
+  if (tile.type === 'railroad') {
+    return 25 * Math.pow(2, Math.max(0, countOwnedRailroads(game, prop.ownerId) - 1));
+  }
+
+  if (tile.type === 'utility') {
+    const utilities = countOwnedUtilities(game, prop.ownerId);
+    return (dice[0] + dice[1]) * (utilities >= 2 ? 10 : 4);
+  }
+
+  const base = tile.rent?.[0] || 0;
+  const group = tile.group;
+  const ownsMonopoly = !!group &&
+    COLOR_GROUP_MAP[group]?.every(id => game.properties[id]?.ownerId === prop.ownerId);
+
+  if (prop.houses > 0) return tile.rent?.[prop.houses] || base;
+  return ownsMonopoly ? base * 2 : base;
+}
+
+function canBuildOnProperty(game: GameState, playerId: string, tileId: number): boolean {
+  const tile = BOARD_TILES[tileId];
+  const prop = game.properties[tileId];
+  if (!tile || tile.type !== 'property' || !tile.group || !prop || prop.ownerId !== playerId || prop.isMortgaged || prop.houses >= 5) return false;
+
+  const groupTiles = COLOR_GROUP_MAP[tile.group] || [];
+  if (!groupTiles.every(id => game.properties[id]?.ownerId === playerId && !game.properties[id]?.isMortgaged)) return false;
+
+  // Official even-building rule: build on the least-developed property first.
+  const levels = groupTiles.map(id => game.properties[id]?.houses || 0);
+  return prop.houses === Math.min(...levels);
+}
+
 // Bot AI helper
 function handleBotTurn(gameId: string) {
   const game = games.get(gameId);
@@ -93,10 +136,12 @@ function handleBotTurn(gameId: string) {
     }
 
     // Roll dice if not rolled
+    let botRolledDouble = false;
     if (!currentGame.hasRolled) {
       const d1 = Math.floor(Math.random() * 6) + 1;
       const d2 = Math.floor(Math.random() * 6) + 1;
       const isDouble = d1 === d2;
+      botRolledDouble = isDouble;
       currentGame.dice = [d1, d2];
       currentGame.hasRolled = true;
 
@@ -165,7 +210,7 @@ function handleBotTurn(gameId: string) {
             });
           } else if (prop && prop.ownerId && prop.ownerId !== bot.id && !prop.isMortgaged) {
             // Pay rent
-            const rent = tile.rent ? tile.rent[prop.houses] : 10;
+            const rent = calculateRent(currentGame, tile, prop, currentGame.dice);
             bot.money -= rent;
             const owner = currentGame.players.find(p => p.id === prop.ownerId);
             if (owner) owner.money += rent;
@@ -197,11 +242,18 @@ function handleBotTurn(gameId: string) {
       });
     }
 
-    // End Bot Turn
+    // Doubles grant the bot another roll, matching the classic rules.
     setTimeout(() => {
-      advanceTurn(currentGame);
-      io.to(gameId).emit('game_updated', currentGame);
-    }, 1000);
+      if (currentGame.status !== 'playing') return;
+      if (botRolledDouble && !bot.inJail && currentGame.doublesCount > 0) {
+        currentGame.hasRolled = false;
+        io.to(gameId).emit('game_updated', currentGame);
+        handleBotTurn(gameId);
+      } else {
+        advanceTurn(currentGame);
+        io.to(gameId).emit('game_updated', currentGame);
+      }
+    }, 700);
 
     io.to(gameId).emit('game_updated', currentGame);
   }, 1200);
@@ -432,22 +484,106 @@ io.on('connection', (socket: Socket) => {
     if (!game || game.status !== 'playing' || game.hasRolled) return;
 
     const currentPlayer = game.players[game.currentPlayerIndex];
-    if (currentPlayer.id !== data.playerId) return;
+    if (!currentPlayer || currentPlayer.id !== data.playerId || currentPlayer.isBankrupt) return;
 
     const d1 = Math.floor(Math.random() * 6) + 1;
     const d2 = Math.floor(Math.random() * 6) + 1;
     const isDouble = d1 === d2;
-
     game.dice = [d1, d2];
     game.hasRolled = true;
 
-    if (isDouble) {
-      game.doublesCount += 1;
+    // Jail rules: doubles release the player; otherwise the attempt is consumed.
+    if (currentPlayer.inJail) {
+      if (isDouble) {
+        currentPlayer.inJail = false;
+        currentPlayer.jailTurns = 0;
+        game.doublesCount = 0;
+        game.logs.push({
+          id: String(Date.now()),
+          stepNumber: game.logs.length + 1,
+          playerId: currentPlayer.id,
+          playerName: currentPlayer.name,
+          action: 'JAIL_ROLL',
+          details: `${currentPlayer.name} rolled doubles and escaped Jail.`,
+          dice: [d1, d2],
+          timestamp: Date.now()
+        });
+      } else {
+        currentPlayer.jailTurns += 1;
+        if (currentPlayer.jailTurns >= 3) {
+          if (currentPlayer.money >= 50) currentPlayer.money -= 50;
+          currentPlayer.inJail = false;
+          currentPlayer.jailTurns = 0;
+          game.logs.push({
+            id: String(Date.now()),
+            stepNumber: game.logs.length + 1,
+            playerId: currentPlayer.id,
+            playerName: currentPlayer.name,
+            action: 'JAIL_FINE',
+            details: `${currentPlayer.name} failed three Jail rolls and paid $50.`,
+            dice: [d1, d2],
+            timestamp: Date.now()
+          });
+        } else {
+          game.logs.push({
+            id: String(Date.now()),
+            stepNumber: game.logs.length + 1,
+            playerId: currentPlayer.id,
+            playerName: currentPlayer.name,
+            action: 'JAIL_ATTEMPT',
+            details: `${currentPlayer.name} did not roll doubles in Jail (${currentPlayer.jailTurns}/3).`,
+            dice: [d1, d2],
+            timestamp: Date.now()
+          });
+          io.to(data.gameId).emit('game_updated', game);
+          return;
+        }
+      }
     } else {
-      game.doublesCount = 0;
+      if (isDouble) game.doublesCount += 1;
+      else game.doublesCount = 0;
+
+      // Three consecutive doubles sends the player directly to Jail.
+      if (game.doublesCount >= 3) {
+        currentPlayer.position = 10;
+        currentPlayer.inJail = true;
+        currentPlayer.jailTurns = 0;
+        game.doublesCount = 0;
+        game.logs.push({
+          id: String(Date.now()),
+          stepNumber: game.logs.length + 1,
+          playerId: currentPlayer.id,
+          playerName: currentPlayer.name,
+          action: 'JAIL_3_DOUBLES',
+          details: `${currentPlayer.name} rolled three consecutive doubles and went to Jail.`,
+          dice: [d1, d2],
+          timestamp: Date.now()
+        });
+        io.to(data.gameId).emit('game_updated', game);
+        return;
+      }
     }
 
-    if (game.doublesCount >= 3) {
+    const oldPos = currentPlayer.position;
+    const newPos = (oldPos + d1 + d2) % 40;
+    currentPlayer.position = newPos;
+
+    if (newPos < oldPos) {
+      currentPlayer.money += 200;
+      game.logs.push({
+        id: String(Date.now()),
+        stepNumber: game.logs.length + 1,
+        playerId: currentPlayer.id,
+        playerName: currentPlayer.name,
+        action: 'PASS_GO',
+        details: `${currentPlayer.name} passed GO and collected $200.`,
+        timestamp: Date.now()
+      });
+    }
+
+    const tile = BOARD_TILES[newPos];
+
+    if (tile.type === 'go-to-jail') {
       currentPlayer.position = 10;
       currentPlayer.inJail = true;
       currentPlayer.jailTurns = 0;
@@ -457,119 +593,128 @@ io.on('connection', (socket: Socket) => {
         stepNumber: game.logs.length + 1,
         playerId: currentPlayer.id,
         playerName: currentPlayer.name,
-        action: 'JAIL_3_DOUBLES',
-        details: `${currentPlayer.name} rolled 3 consecutive doubles and was sent to Jail!`,
-        dice: [d1, d2],
+        action: 'SENT_TO_JAIL',
+        details: `${currentPlayer.name} landed on Go To Jail.`,
         timestamp: Date.now()
       });
-    } else {
-      const oldPos = currentPlayer.position;
-      const newPos = (oldPos + d1 + d2) % 40;
-      currentPlayer.position = newPos;
+    } else if (tile.type === 'tax') {
+      const tax = tile.taxAmount || 100;
+      currentPlayer.money -= tax;
+      game.logs.push({
+        id: String(Date.now()),
+        stepNumber: game.logs.length + 1,
+        playerId: currentPlayer.id,
+        playerName: currentPlayer.name,
+        action: 'TAX_PAID',
+        details: `${currentPlayer.name} paid $${tax} in taxes.`,
+        timestamp: Date.now()
+      });
+    } else if (tile.type === 'chance' || tile.type === 'community-chest') {
+      const deck = tile.type === 'chance' ? CHANCE_CARDS : COMMUNITY_CHEST_CARDS;
+      const card = deck[Math.floor(Math.random() * deck.length)];
+      game.activeCard = card;
 
-      if (newPos < oldPos) {
-        currentPlayer.money += 200;
-        game.logs.push({
-          id: String(Date.now()),
-          stepNumber: game.logs.length + 1,
-          playerId: currentPlayer.id,
-          playerName: currentPlayer.name,
-          action: 'PASS_GO',
-          details: `${currentPlayer.name} passed GO and collected $200!`,
-          timestamp: Date.now()
-        });
-      }
-
-      const tile = BOARD_TILES[newPos];
-
-      // Handle card or penalty landings
-      if (tile.type === 'go-to-jail') {
+      if (card.action === 'money' && card.amount) {
+        currentPlayer.money += card.amount;
+      } else if (card.action === 'move' && card.destination !== undefined) {
+        if (card.destination < currentPlayer.position) currentPlayer.money += 200;
+        currentPlayer.position = card.destination;
+      } else if (card.action === 'jail') {
         currentPlayer.position = 10;
         currentPlayer.inJail = true;
-        game.logs.push({
-          id: String(Date.now()),
-          stepNumber: game.logs.length + 1,
-          playerId: currentPlayer.id,
-          playerName: currentPlayer.name,
-          action: 'SENT_TO_JAIL',
-          details: `${currentPlayer.name} landed on Go To Jail!`,
-          timestamp: Date.now()
-        });
-      } else if (tile.type === 'tax') {
-        const tax = tile.taxAmount || 100;
-        currentPlayer.money -= tax;
-        game.logs.push({
-          id: String(Date.now()),
-          stepNumber: game.logs.length + 1,
-          playerId: currentPlayer.id,
-          playerName: currentPlayer.name,
-          action: 'TAX_PAID',
-          details: `${currentPlayer.name} paid $${tax} in taxes.`,
-          timestamp: Date.now()
-        });
-      } else if (tile.type === 'chance') {
-        const card = CHANCE_CARDS[Math.floor(Math.random() * CHANCE_CARDS.length)];
-        game.activeCard = card;
-        if (card.action === 'money' && card.amount) {
-          currentPlayer.money += card.amount;
-        } else if (card.action === 'move' && card.destination !== undefined) {
-          currentPlayer.position = card.destination;
-        } else if (card.action === 'jail') {
-          currentPlayer.position = 10;
-          currentPlayer.inJail = true;
-        } else if (card.action === 'jail_free') {
-          currentPlayer.hasJailCard = true;
-        }
-        game.logs.push({
-          id: String(Date.now()),
-          stepNumber: game.logs.length + 1,
-          playerId: currentPlayer.id,
-          playerName: currentPlayer.name,
-          action: 'CHANCE_CARD',
-          details: `${currentPlayer.name} drew Chance: "${card.title}" - ${card.text}`,
-          timestamp: Date.now()
-        });
-      } else if (tile.type === 'community-chest') {
-        const card = COMMUNITY_CHEST_CARDS[Math.floor(Math.random() * COMMUNITY_CHEST_CARDS.length)];
-        game.activeCard = card;
-        if (card.action === 'money' && card.amount) {
-          currentPlayer.money += card.amount;
-        } else if (card.action === 'jail') {
-          currentPlayer.position = 10;
-          currentPlayer.inJail = true;
-        } else if (card.action === 'jail_free') {
-          currentPlayer.hasJailCard = true;
-        }
-        game.logs.push({
-          id: String(Date.now()),
-          stepNumber: game.logs.length + 1,
-          playerId: currentPlayer.id,
-          playerName: currentPlayer.name,
-          action: 'COMMUNITY_CARD',
-          details: `${currentPlayer.name} drew Community Chest: "${card.title}" - ${card.text}`,
-          timestamp: Date.now()
-        });
-      } else if (tile.type === 'property' || tile.type === 'railroad' || tile.type === 'utility') {
-        const prop = game.properties[tile.id];
-        if (prop && prop.ownerId && prop.ownerId !== currentPlayer.id && !prop.isMortgaged) {
-          const rent = tile.rent ? tile.rent[prop.houses] : 25;
-          currentPlayer.money -= rent;
-          const owner = game.players.find(p => p.id === prop.ownerId);
-          if (owner) owner.money += rent;
+        currentPlayer.jailTurns = 0;
+        game.doublesCount = 0;
+      } else if (card.action === 'jail_free') {
+        currentPlayer.hasJailCard = true;
+      }
 
-          game.logs.push({
-            id: String(Date.now()),
-            stepNumber: game.logs.length + 1,
-            playerId: currentPlayer.id,
-            playerName: currentPlayer.name,
-            action: 'RENT_PAID',
-            details: `${currentPlayer.name} landed on ${tile.name} and paid $${rent} rent to ${owner?.name}.`,
-            timestamp: Date.now()
-          });
-        }
+      game.logs.push({
+        id: String(Date.now()),
+        stepNumber: game.logs.length + 1,
+        playerId: currentPlayer.id,
+        playerName: currentPlayer.name,
+        action: tile.type === 'chance' ? 'CHANCE_CARD' : 'COMMUNITY_CARD',
+        details: `${currentPlayer.name} drew ${tile.type === 'chance' ? 'Chance' : 'Community Chest'}: "${card.title}".`,
+        timestamp: Date.now()
+      });
+    } else if (tile.type === 'property' || tile.type === 'railroad' || tile.type === 'utility') {
+      const prop = game.properties[tile.id];
+
+      if (prop?.ownerId && prop.ownerId !== currentPlayer.id && !prop.isMortgaged) {
+        const rent = calculateRent(game, tile, prop, game.dice);
+        currentPlayer.money -= rent;
+        const owner = game.players.find(p => p.id === prop.ownerId);
+        if (owner) owner.money += rent;
+
+        game.logs.push({
+          id: String(Date.now()),
+          stepNumber: game.logs.length + 1,
+          playerId: currentPlayer.id,
+          playerName: currentPlayer.name,
+          action: 'RENT_PAID',
+          details: `${currentPlayer.name} paid $${rent} rent to ${owner?.name || 'the owner'} at ${tile.name}.`,
+          timestamp: Date.now()
+        });
       }
     }
 
+    if (currentPlayer.money < 0) {
+      currentPlayer.isBankrupt = true;
+      game.logs.push({
+        id: String(Date.now()),
+        stepNumber: game.logs.length + 1,
+        playerId: currentPlayer.id,
+        playerName: currentPlayer.name,
+        action: 'BANKRUPT',
+        details: `${currentPlayer.name} went bankrupt.`,
+        timestamp: Date.now()
+      });
+    }
+
+    io.to(data.gameId).emit('game_updated', game);
+  });
+
+  // Jail: pay $50 before rolling.
+  socket.on('pay_jail_fine', (data: { gameId: string; playerId: string }) => {
+    const game = games.get(data.gameId);
+    if (!game || game.status !== 'playing' || game.hasRolled) return;
+    const player = game.players[game.currentPlayerIndex];
+    if (!player || player.id !== data.playerId || !player.inJail || player.money < 50) return;
+
+    player.money -= 50;
+    player.inJail = false;
+    player.jailTurns = 0;
+    game.logs.push({
+      id: String(Date.now()),
+      stepNumber: game.logs.length + 1,
+      playerId: player.id,
+      playerName: player.name,
+      action: 'PAY_JAIL_FINE',
+      details: `${player.name} paid $50 to leave Jail.`,
+      timestamp: Date.now()
+    });
+    io.to(data.gameId).emit('game_updated', game);
+  });
+
+  // Jail: use a Get Out of Jail Free card before rolling.
+  socket.on('use_jail_card', (data: { gameId: string; playerId: string }) => {
+    const game = games.get(data.gameId);
+    if (!game || game.status !== 'playing' || game.hasRolled) return;
+    const player = game.players[game.currentPlayerIndex];
+    if (!player || player.id !== data.playerId || !player.inJail || !player.hasJailCard) return;
+
+    player.hasJailCard = false;
+    player.inJail = false;
+    player.jailTurns = 0;
+    game.logs.push({
+      id: String(Date.now()),
+      stepNumber: game.logs.length + 1,
+      playerId: player.id,
+      playerName: player.name,
+      action: 'USE_JAIL_CARD',
+      details: `${player.name} used a Get Out of Jail Free card.`,
+      timestamp: Date.now()
+    });
     io.to(data.gameId).emit('game_updated', game);
   });
 
@@ -582,7 +727,19 @@ io.on('connection', (socket: Socket) => {
     const tile = BOARD_TILES[data.tileId];
     const prop = game.properties[data.tileId];
 
-    if (player && tile && prop && prop.ownerId === null && tile.price && player.money >= tile.price) {
+    const currentPlayer = game.players[game.currentPlayerIndex];
+    if (
+      player &&
+      currentPlayer?.id === player.id &&
+      game.hasRolled &&
+      player.position === data.tileId &&
+      tile &&
+      prop &&
+      prop.ownerId === null &&
+      tile.price &&
+      player.money >= tile.price &&
+      (tile.type === 'property' || tile.type === 'railroad' || tile.type === 'utility')
+    ) {
       player.money -= tile.price;
       prop.ownerId = player.id;
 
@@ -609,7 +766,17 @@ io.on('connection', (socket: Socket) => {
     const tile = BOARD_TILES[data.tileId];
     const prop = game.properties[data.tileId];
 
-    if (player && tile && prop && prop.ownerId === player.id && tile.houseCost && prop.houses < 5 && player.money >= tile.houseCost) {
+    const currentPlayer = game.players[game.currentPlayerIndex];
+    if (
+      player &&
+      currentPlayer?.id === player.id &&
+      game.hasRolled &&
+      tile &&
+      prop &&
+      tile.houseCost &&
+      canBuildOnProperty(game, player.id, data.tileId) &&
+      player.money >= tile.houseCost
+    ) {
       player.money -= tile.houseCost;
       prop.houses += 1;
 
@@ -635,6 +802,14 @@ io.on('connection', (socket: Socket) => {
 
     const currentPlayer = game.players[game.currentPlayerIndex];
     if (currentPlayer.id !== data.playerId) return;
+
+    // Doubles grant an extra roll; the player must roll again instead of ending the turn.
+    if (game.doublesCount > 0 && !currentPlayer.inJail) {
+      game.hasRolled = false;
+      game.currentTurnTimer = 30;
+      io.to(data.gameId).emit('game_updated', game);
+      return;
+    }
 
     advanceTurn(game);
     io.to(data.gameId).emit('game_updated', game);
