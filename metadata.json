@@ -1,0 +1,6 @@
+{
+  "name": "Monopoly Empire",
+  "description": "Full-stack real-time multiplayer Monopoly platform with board engine, lobbies, live voice/chat, game replays, and multi-language support.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
